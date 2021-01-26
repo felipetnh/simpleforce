@@ -7,7 +7,6 @@ import (
 	"html"
 	"io"
 	"io/ioutil"
-	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -59,7 +58,7 @@ type QueryResult struct {
 // Query runs an SOQL query. q could either be the SOQL string or the nextRecordsURL.
 func (client *Client) Query(q string) (*QueryResult, error) {
 	if !client.isLoggedIn() {
-		return nil, ErrAuthentication
+		return nil, errors.New("Client is not logged in")
 	}
 
 	var u string
@@ -78,7 +77,6 @@ func (client *Client) Query(q string) (*QueryResult, error) {
 
 	data, err := client.httpRequest("GET", u, nil)
 	if err != nil {
-		log.Println("HTTP GET request failed:", u)
 		return nil, err
 	}
 
@@ -142,7 +140,6 @@ func (client *Client) LoginPassword(username, password, token string) error {
 	url := fmt.Sprintf("%s/services/Soap/u/%s", client.baseURL, client.apiVersion)
 	req, err := http.NewRequest(http.MethodPost, url, strings.NewReader(soapBody))
 	if err != nil {
-		log.Println(logPrefix, "error occurred creating request,", err)
 		return err
 	}
 	req.Header.Add("Content-Type", "text/xml")
@@ -151,20 +148,20 @@ func (client *Client) LoginPassword(username, password, token string) error {
 
 	resp, err := client.httpClient.Do(req)
 	if err != nil {
-		log.Println(logPrefix, "error occurred submitting request,", err)
 		return err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		log.Println(logPrefix, "request failed,", resp.StatusCode)
-		return ErrFailure
+		return errors.New(
+			fmt.Sprintf("Response status code error -- Status Code: %s", resp.StatusCode),
+		)
 	}
 
 	respData, err := ioutil.ReadAll(resp.Body)
 
 	if err != nil {
-		log.Println(logPrefix, "error occurred reading response data,", err)
+		return err
 	}
 
 	var loginResponse struct {
@@ -179,19 +176,20 @@ func (client *Client) LoginPassword(username, password, token string) error {
 
 	err = xml.Unmarshal(respData, &loginResponse)
 	if err != nil {
-		log.Println(logPrefix, "error occurred parsing login response,", err)
 		return err
 	}
 
 	// Now we should all be good and the sessionID can be used to talk to salesforce further.
 	client.sessionID = loginResponse.SessionID
-	client.instanceURL = parseHost(loginResponse.ServerURL)
+	client.instanceURL, err = parseHost(loginResponse.ServerURL, client)
+	if err != nil {
+		return err
+	}
 	client.user.id = loginResponse.UserID
 	client.user.name = loginResponse.UserName
 	client.user.email = loginResponse.UserEmail
 	client.user.fullName = loginResponse.UserFullName
 
-	log.Println("User", client.user.name, "authenticated.")
 	return nil
 }
 
@@ -212,11 +210,31 @@ func (client *Client) httpRequest(method, url string, body io.Reader) ([]byte, e
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		log.Println(logPrefix, "status:", resp.StatusCode)
-		return nil, ErrFailure
+		respErrorBody, e := ioutil.ReadAll(resp.Body)
+		if e == nil {
+			e = errors.New(
+				fmt.Sprintf(
+					"Response status code error -- Status: %s . With error: %s",
+					resp.Status,
+					string(respErrorBody),
+				),
+			)
+			return nil, e
+		}
+		err = errors.New(
+			fmt.Sprintf(
+				"Response status code error -- Status: %s",
+				resp.Status,
+			),
+		)
+		return nil, err
 	}
 
-	return ioutil.ReadAll(resp.Body)
+	respBody, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	return respBody, nil
 }
 
 // makeURL generates a REST API URL based on baseURL, APIVersion of the client.
@@ -243,7 +261,8 @@ func NewClient(url, clientID, apiVersion string) *Client {
 	return client
 }
 
-func (client *Client) SetHttpClient(c *http.Client) {
+// SetHTTPClient set a new HTTP client
+func (client *Client) SetHTTPClient(c *http.Client) {
 	client.httpClient = c
 }
 
@@ -258,6 +277,10 @@ func (client *Client) DownloadFile(contentVersionID string, filepath string) err
 	// Get the data
 	httpClient := client.httpClient
 	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return err
+	}
+
 	req.Header.Add("Content-Type", "application/json; charset=UTF-8")
 	req.Header.Add("Accept", "application/json")
 	req.Header.Add("Authorization", "Bearer "+client.sessionID)
@@ -278,13 +301,16 @@ func (client *Client) DownloadFile(contentVersionID string, filepath string) err
 
 	// Write the body to file
 	_, err = io.Copy(out, resp.Body)
-	return err
+	if err != nil {
+		return err
+	}
+	return nil
 }
 
-func parseHost(input string) string {
+func parseHost(input string, client *Client) (string, error) {
 	parsed, err := url.Parse(input)
-	if err == nil {
-		return fmt.Sprintf("%s://%s", parsed.Scheme, parsed.Host)
+	if err != nil {
+		return "", err
 	}
-	return "Failed to parse URL input"
+	return fmt.Sprintf("%s://%s", parsed.Scheme, parsed.Host), nil
 }
